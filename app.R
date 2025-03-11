@@ -1,0 +1,177 @@
+library(shiny)
+library(sf)
+library(leaflet)
+library(leaflet.extras)
+library(dplyr)
+library(ggplot2)
+library(dbscan)
+library(lubridate)
+
+# UI for the app
+ui <- fluidPage(
+  titlePanel("Crime Analysis"),
+  sidebarLayout(
+    sidebarPanel(
+      selectInput("crime_type", "Select a crime type:", choices = NULL, multiple = FALSE),
+      actionButton("enter", "Enter"),
+      h4("Top 10 Crimes by Frequency"),
+      tableOutput("top_crimes_table"),
+      h4("Frequency of Selected Crime by Year"),
+      plotOutput("crime_frequency_by_year"),
+      h4("Model Accuracy"),
+      textOutput("model_accuracy")
+    ),
+    mainPanel(
+      leafletOutput("crime_map"),
+      h4("Predicted Crime Hotspots (Next 12 Months)"),
+      leafletOutput("prediction_map")
+    )
+  )
+)
+
+# Server for creating the app
+server <- function(input, output, session) {
+  #Data collected from official websites of UK
+  west_admin <- st_read("westminster_admin.shp")
+  west_dist <- st_read("wards_in_westminster.shp")
+  west_crime <- st_read("crimes_westminster.shp")
+  
+
+  west_admin <- st_transform(west_admin, 4326)
+  west_dist <- st_transform(west_dist, 4326)
+  west_crime <- st_transform(west_crime, 4326) %>%
+    mutate(Date = as.Date(paste0(Month, "-01")),
+           Days = as.numeric(Date - min(Date)))
+  
+  # Top 10 crimes in Westminster
+  top_crimes <- west_crime %>%
+    as.data.frame() %>%
+    count(Crime.type, sort = TRUE) %>%
+    slice_max(n, n = 10)
+  
+  updateSelectInput(session, "crime_type", choices = top_crimes$Crime.type)
+  
+  filtered_crime <- reactiveVal(NULL)
+  
+  observeEvent(input$enter, {
+    req(input$crime_type)
+    filtered_data <- west_crime %>%
+      filter(Crime.type == input$crime_type)
+    filtered_crime(filtered_data)
+  })
+  
+  # Current crime map
+  output$crime_map <- renderLeaflet({
+    leaflet() %>%
+      addTiles() %>%
+      setView(lng = -0.1387, lat = 51.4975, zoom = 13) %>%
+      addPolygons(data = west_admin, color = "#1f78b4", weight = 2, fillOpacity = 0) %>%
+      addPolygons(data = west_dist, color = "red", weight = 1, fillOpacity = 0)
+  })
+  
+  observeEvent(filtered_crime(), {
+    req(filtered_crime())
+    leafletProxy("crime_map") %>%
+      clearHeatmap() %>%
+      clearControls() %>%
+      addHeatmap(data = filtered_crime(),
+                 lng = ~Longitude, lat = ~Latitude,
+                 radius = 10, blur = 15, intensity = 0.5) %>%
+      addLegend(position = "bottomright", 
+                pal = colorNumeric("Reds", NULL),
+                values = 1:10,
+                title = "Crime Density",
+                opacity = 1)
+  })
+  
+  output$top_crimes_table <- renderTable({ top_crimes })
+  
+  output$crime_frequency_by_year <- renderPlot({
+    req(filtered_crime())
+    filtered_crime() %>%
+      mutate(Year = format(Date, "%Y")) %>%
+      count(Year) %>%
+      ggplot(aes(x = Year, y = n)) +
+      geom_bar(stat = "identity", fill = "steelblue") +
+      labs(title = paste("Frequency of", input$crime_type, "by Year"),
+           x = "Year", y = "Frequency") +
+      theme_minimal() +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  })
+  
+  #
+  predictions <- reactive({
+    req(filtered_crime())  
+    
+    crime_data <- filtered_crime() %>%
+      st_drop_geometry() %>%
+      select(Longitude, Latitude, Days)
+    
+    max_day <- max(crime_data$Days)
+    train <- crime_data %>% filter(Days <= (max_day - 365))
+    test <- crime_data %>% filter(Days > (max_day - 365))
+    
+    if (nrow(train) == 0 || nrow(test) == 0) {
+      return(list(accuracy = 0, data = NULL))
+    }
+    
+  
+    train_scaled <- train %>%
+      mutate(across(c(Longitude, Latitude, Days), scale))
+    
+    # Clustering using DBSCAN
+    dbscan_result <- dbscan(train_scaled, eps = 0.5, minPts = 5)
+    train$Cluster <- dbscan_result$cluster
+    
+    # Calculating accuracy
+    clusters <- train %>% filter(Cluster != 0)
+    accuracy <- if (nrow(clusters) > 0) {
+      cluster_polygons <- clusters %>%
+        st_as_sf(coords = c("Longitude", "Latitude"), crs = 4326) %>%
+        group_by(Cluster) %>%
+        summarise(geometry = st_convex_hull(st_combine(geometry)))
+      test_sf <- st_as_sf(test, coords = c("Longitude", "Latitude"), crs = 4326)
+      intersections <- st_intersects(test_sf, cluster_polygons)
+      round(sum(lengths(intersections) > 0) / nrow(test) * 100, 2)
+    } else {
+      0
+    }
+    
+    list(accuracy = accuracy, data = train)
+  })
+  
+  
+  output$model_accuracy <- renderText({
+    req(predictions()$accuracy) 
+    paste("Accuracy:", predictions()$accuracy, "% (Test crimes in predicted areas)")
+  })
+  
+  # Prediction map
+  output$prediction_map <- renderLeaflet({
+    req(predictions()$data) 
+    
+    leaflet() %>%
+      addTiles() %>%
+      setView(lng = -0.1387, lat = 51.4975, zoom = 13) %>%
+      addPolygons(data = west_admin, color = "#1f78b4", weight = 2, fillOpacity = 0) %>%
+      addPolygons(data = west_dist, color = "red", weight = 1, fillOpacity = 0) %>%
+      addHeatmap(
+        data = predictions()$data,
+        lng = ~Longitude,
+        lat = ~Latitude,
+        radius = 12,
+        blur = 20,
+        intensity = 0.7,
+        gradient = "Reds"
+      ) %>%
+      addLegend(
+        position = "bottomright",
+        pal = colorNumeric("Reds", NULL),
+        values = 1:10,
+        title = "Predicted Crime Density",
+        opacity = 1
+      )
+  })
+}
+
+shinyApp(ui = ui, server = server)
